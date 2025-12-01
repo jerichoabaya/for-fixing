@@ -1,0 +1,657 @@
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_TCS34725.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <LittleFS.h>
+#include <FS.h> 
+#include <HTTPClient.h> 
+#include <ArduinoJson.h>
+
+// --- WIFI CREDENTIALS ---
+#define WIFI_SSID "iPhone 11"
+#define WIFI_PASSWORD "11142000"
+
+// --- STATION AND DEVICE ID ---
+const char* sensorId = "ISUIT-WQTAMS-0001"; 
+
+// --- STATIC IP CONFIGURATION ---
+IPAddress staticIP(192, 168, 68, 250);
+IPAddress gateway(192, 168, 68, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+// --- REMOTE SERVER CONFIGURATION ---
+// CORRECTED: Changed from dashboard.php to sensor_data.php endpoint
+const char* serverUrl = "http://water.monitoring.ehub.ph/sensor_data.php";
+unsigned long lastUploadTime = 0;
+
+WebServer server(80);
+
+// --- PIN DEFINITIONS ---
+const int VALVE_IN_PIN    = 2;
+const int VALVE_OUT_PIN   = 4;
+const int PUMP_PIN        = 16;
+const int LEVEL_SENSOR_PIN = 34;
+const int PUMP_SWITCH_PIN = 17; // Momentary push button for Pump Mode toggle
+const int MANUAL_START_PIN = 13; // Manual start button
+const int TDS_PIN         = 35;
+const int PH_PIN          = 32;
+const int TURBIDITY_PIN   = 33;
+const int LEAD_PIN        = 36;
+
+LiquidCrystal_I2C lcd(0x27, 16, 4);
+Adafruit_TCS34725 tcs = Adafruit_TCS34725();
+
+// --- COLOR SENSOR CALIBRATION CONSTANTS ---
+const float COLOR_CAL_A = 0.53;
+const float COLOR_CAL_B = 5.2;
+
+// --- STATE MACHINE SETUP ---
+enum SystemState {
+    IDLE,
+    WEB_START,
+    MANUAL_START,
+    CYCLE_START_DELAY,
+    FILL_MAIN,
+    FILL_PUMP,
+    SENSING,
+    DISPLAY_READINGS,
+    DRAINING,
+    CYCLE_END_DELAY
+};
+SystemState currentState = IDLE;
+bool pumpModeActive = false; // Tracks current mode (false = Solenoid, true = Pump)
+bool webTriggered = false;
+
+// --- TIME CONSTANTS ---
+const long STABILIZATION_TIME_MS = 3000;
+const long DRAIN_TIME_MS   = 40000;
+const int CYCLE_DELAY_SEC = 5;
+const long DISPLAY_GROUP_TIME_MS = 5000;
+const long WIFI_CHECK_INTERVAL_MS = 10000;
+const long WIFI_STATUS_DISPLAY_TIME = 3000; // Show WiFi status for 3 seconds
+
+// --- GLOBAL VARIABLES ---
+float tdsValue, phValue, turbidityValue, leadValue, tcuValue;
+uint16_t r, g, b, c_raw;
+char colorResult[10] = "UNKNOWN";
+char tdsStatus[10] = "";
+char phStatus[10] = "";
+char turbidityStatus[10] = "";
+char leadStatus[10] = "";
+char colorStatus[10] = "";
+unsigned long sensingStartTime = 0;
+unsigned long displayGroupTimer = 0;
+int displayGroupIndex = 0;
+bool isWiFiConnected = false;
+unsigned long lastWiFiCheckTime = 0;
+bool lcdShowingWiFiStatus = false;
+unsigned long wifiStatusDisplayStart = 0;
+
+// --- BUTTON DEBOUNCE ---
+unsigned long lastButtonPress = 0;
+unsigned long lastModeSwitchPress = 0;
+const unsigned long debounceDelay = 250;
+
+// --- FUNCTION PROTOTYPES ---
+void connectToWiFi();
+void handleStartTest();
+void handleReadings();
+void handleRoot();
+void calculateTDSStatus();
+void calculatePHStatus();
+void calculateTurbidityStatus();
+void calculateLeadStatus();
+void calculateColorStatus();
+void analyzeColor();
+void readAllSensors();
+void displaySensorReading(int index);
+void sendDataToServer();
+void updateIdleDisplay();
+String getStatus(float value, float safeMin, float safeMax, float warningMin, float warningMax); // Added from original code
+
+// ------------------------------------------------------------------
+// WIFI AND WEB SERVER FUNCTIONS - UPDATED
+// ------------------------------------------------------------------
+
+void connectToWiFi() {
+    Serial.println("Attempting to connect to WiFi...");
+
+    if (!WiFi.config(staticIP, gateway, subnet)) {
+        Serial.println("Static IP configuration failed!");
+    }
+
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected.");
+        lcd.clear();
+        lcd.print("WiFi Connected!  ✅");
+        lcd.setCursor(0, 1);
+        Serial.print("Web Access IP: ");
+        Serial.println(WiFi.localIP());
+        lcd.print(WiFi.localIP());
+        isWiFiConnected = true;
+        lcdShowingWiFiStatus = true;
+        wifiStatusDisplayStart = millis();
+    } else {
+        Serial.println("\nWiFi Failed. Running offline.");
+        lcd.clear();
+        lcd.print("No internet");
+        lcd.setCursor(0, 1);
+        lcd.print("connection");
+        isWiFiConnected = false;
+        lcdShowingWiFiStatus = true;
+        wifiStatusDisplayStart = millis();
+    }
+}
+
+void sendDataToServer() {
+    if (!isWiFiConnected) {
+        Serial.println("Upload Skipped: WiFi not connected.");
+        return;
+    }
+    
+    const int MAX_RETRIES = 3;
+    
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi disconnected during upload attempt.");
+            return;
+        }
+        
+        HTTPClient http;
+        WiFiClient client;
+        
+        Serial.printf("\nAttempt %d: Uploading to %s\n", attempt + 1, serverUrl);
+        
+        http.begin(client, serverUrl); // Use WiFiClient for better reliability
+        http.addHeader("Content-Type", "application/json");
+        
+        // Create JSON payload matching the original code format
+        StaticJsonDocument<512> doc;
+        doc["TDS_Value"] = tdsValue;
+        doc["TDS_Status"] = tdsStatus;
+        doc["PH_Value"] = phValue;
+        doc["PH_Status"] = phStatus;
+        doc["Turbidity_Value"] = turbidityValue;
+        doc["Turbidity_Status"] = turbidityStatus;
+        doc["Lead_Value"] = leadValue;
+        doc["Lead_Status"] = leadStatus;
+        doc["Color_Result"] = colorResult;
+        doc["Color_Status"] = colorStatus;
+        
+        String jsonPayload;
+        serializeJson(doc, jsonPayload);
+        
+        Serial.print("Payload: ");
+        Serial.println(jsonPayload);
+
+        int httpResponseCode = http.POST(jsonPayload);
+
+        if (httpResponseCode > 0) {
+            Serial.printf("Server Success. Response code: %d\n", httpResponseCode);
+            String response = http.getString();
+            Serial.print("Server Response: ");
+            Serial.println(response);
+
+            if (httpResponseCode >= 200 && httpResponseCode < 300) {
+                lastUploadTime = millis(); 
+                http.end();
+                return;
+            }
+        } else {
+            Serial.printf("Server HTTP Error: %d\n", httpResponseCode);
+        }
+
+        http.end();
+
+        if (attempt < MAX_RETRIES - 1) {
+            long delayTime = (long)pow(2, attempt) * 1000;
+            Serial.printf("Retrying in %ld ms...\n", delayTime);
+            delay(delayTime);
+        }
+    }
+    
+    Serial.println("Upload failed after all retries.");
+}
+
+void handleStartTest() {
+    if (currentState == IDLE) {
+        webTriggered = true;
+        currentState = WEB_START;
+        server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Test cycle started.\"}");
+    } else {
+        server.send(409, "application/json", "{\"status\":\"error\",\"message\":\"System busy.\"}");
+    }
+}
+
+void handleReadings() {
+    StaticJsonDocument<512> doc;
+    
+    doc["TDS_Value"] = tdsValue;
+    doc["TDS_Status"] = tdsStatus;
+    doc["PH_Value"] = phValue;
+    doc["PH_Status"] = phStatus;
+    doc["Turbidity_Value"] = turbidityValue;
+    doc["Turbidity_Status"] = turbidityStatus;
+    doc["Lead_Value"] = leadValue;
+    doc["Lead_Status"] = leadStatus;
+    doc["Color_Result"] = colorResult;
+    doc["Color_Status"] = colorStatus;
+    doc["Color_Value"] = tcuValue;
+    
+    String jsonResponse;
+    serializeJson(doc, jsonResponse);
+    
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", jsonResponse);
+}
+
+void handleRoot() {
+    String html = "<html><head><title>Water Monitor</title></head>";
+    html += "<body>";
+    html += "<h1>Water Quality Monitoring System</h1>";
+    html += "<p>Sensor ID: " + String(sensorId) + "</p>";
+    html += "<p><a href='/readings'>View Current Readings</a></p>";
+    html += "<form action='/start_test' method='POST'>";
+    html += "<input type='submit' value='Start Test Cycle'>";
+    html += "</form>";
+    html += "</body></html>";
+    
+    server.send(200, "text/html", html);
+}
+
+// ------------------------------------------------------------------
+// CORE FUNCTIONS - UPDATED TO USE CORRECT THRESHOLDS
+// ------------------------------------------------------------------
+
+void calculateTDSStatus() {
+    strcpy(tdsStatus, getStatus(tdsValue, 0, 300, 500, 1000).c_str());
+}
+
+void calculatePHStatus() {
+    strcpy(phStatus, getStatus(phValue, 6.5, 8.5, 6.0, 9.0).c_str());
+}
+
+void calculateTurbidityStatus() {
+    strcpy(turbidityStatus, getStatus(turbidityValue, 0, 5, 10, 50).c_str());
+}
+
+void calculateLeadStatus() {
+    strcpy(leadStatus, getStatus(leadValue, 0, 0.01, 0.015, 0.02).c_str());
+}
+
+void calculateColorStatus() {
+    strcpy(colorStatus, "Safe"); // Default, adjust if needed
+}
+
+void analyzeColor() {
+    tcs.getRawData(&r, &g, &b, &c_raw);
+    tcuValue = COLOR_CAL_A * c_raw + COLOR_CAL_B;
+
+    if (c_raw > 1000 && abs(r - g) < 200 && abs(g - b) < 200) {
+        strcpy(colorResult, "Clear");
+    } else {
+        strcpy(colorResult, "Other");
+    }
+
+    calculateColorStatus();
+}
+
+void readAllSensors() {
+    // Read actual sensor values from pins
+    int tdsRaw = analogRead(TDS_PIN);
+    tdsValue = tdsRaw * 0.5; // Convert to mg/L based on calibration
+    
+    int phRaw = analogRead(PH_PIN);
+    phValue = map(phRaw, 0, 4095, 0, 1400) / 100.0; // 0-14 pH scale
+    
+    int turbidityRaw = analogRead(TURBIDITY_PIN);
+    turbidityValue = turbidityRaw * 0.01; // Convert to NTU
+    
+    int leadRaw = analogRead(LEAD_PIN);
+    leadValue = leadRaw * 0.00001; // Convert to mg/L
+    
+    analyzeColor();
+    calculateTDSStatus();
+    calculatePHStatus();
+    calculateTurbidityStatus();
+    calculateLeadStatus();
+}
+
+String getStatus(float value, float safeMin, float safeMax, float warningMin, float warningMax) {
+    if (value >= safeMin && value <= safeMax) {
+        return "Safe";
+    } else if (value >= warningMin && value <= warningMax) {
+        return "Warning";
+    } else {
+        return "Failed";
+    }
+}
+
+void displaySensorReading(int index) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    switch(index) {
+        case 0: 
+            lcd.printf("TDS: %.1f mg/L", tdsValue); 
+            lcd.setCursor(0, 1); 
+            lcd.printf("Status: %s", tdsStatus); 
+            break;
+        case 1: 
+            lcd.printf("pH: %.2f", phValue); 
+            lcd.setCursor(0, 1); 
+            lcd.printf("Status: %s", phStatus); 
+            break;
+        case 2: 
+            // Turbidity uses 4 lines
+            lcd.setCursor(0, 0); 
+            lcd.print("Turbidity:");           
+            lcd.setCursor(0, 1); 
+            lcd.printf("%.1f NTU", turbidityValue); 
+            lcd.setCursor(-4, 2); 
+            lcd.printf("Status: %s", turbidityStatus); 
+            break;
+        case 3: 
+            lcd.printf("Lead: %.3f mg/L", leadValue); 
+            lcd.setCursor(0, 1); 
+            lcd.printf("Status: %s", leadStatus); 
+            break;
+        case 4: 
+            lcd.printf("Color: %.1f CU", tcuValue); 
+            lcd.setCursor(0, 1); 
+            lcd.printf("Status: %s", colorStatus); 
+            lcd.setCursor(0, 2);
+            lcd.printf("Result: %s", colorResult);
+            break;
+    }
+}
+
+void updateIdleDisplay() {
+    lcd.clear();
+    
+    // First line: Show system status
+    if (isWiFiConnected) {
+        lcd.print("System Online");
+    } else {
+        lcd.print("Mode: Offline");
+    }
+    
+    // Second line: Show current water inlet mode
+    lcd.setCursor(0, 1);
+    if (pumpModeActive) {
+        lcd.print("WATER INLET:PUMP");
+    } else {
+        lcd.print("WATER INLET:MAIN");
+    }
+}
+
+// ------------------------------------------------------------------
+// SETUP FUNCTION - UPDATED
+// ------------------------------------------------------------------
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    // Initialize analog pins
+    pinMode(TDS_PIN, INPUT);
+    pinMode(PH_PIN, INPUT);
+    pinMode(TURBIDITY_PIN, INPUT);
+    pinMode(LEAD_PIN, INPUT);
+
+    // Pin setup
+    pinMode(VALVE_IN_PIN, OUTPUT);
+    pinMode(VALVE_OUT_PIN, OUTPUT);
+    pinMode(PUMP_PIN, OUTPUT);
+    pinMode(LEVEL_SENSOR_PIN, INPUT);
+    pinMode(PUMP_SWITCH_PIN, INPUT_PULLUP);
+    pinMode(MANUAL_START_PIN, INPUT_PULLUP);
+    
+    // Ensure all outputs are off initially
+    digitalWrite(VALVE_IN_PIN, HIGH);
+    digitalWrite(VALVE_OUT_PIN, HIGH);
+    digitalWrite(PUMP_PIN, HIGH);
+
+    // LCD Setup
+    lcd.init();
+    lcd.backlight();
+
+    lcd.setCursor(0, 0);     // First line
+    lcd.print("LOADING...");
+
+    lcd.setCursor(0, 1);     // Second line
+    lcd.print("PLEASE WAIT");
+
+    // Color Sensor Setup
+    if (!tcs.begin()) {
+        Serial.println("TCS34725 Not Found! Check wiring.");
+        lcd.clear();
+        lcd.print("Color Sensor");
+        lcd.setCursor(0, 1);
+        lcd.print("Not Found!");
+        delay(2000);
+    }
+
+    // Print Sensor ID
+    WiFi.mode(WIFI_STA);
+    Serial.print("Device Sensor ID: ");
+    Serial.println(sensorId);
+
+    connectToWiFi();
+
+    if (!LittleFS.begin(true)){
+        Serial.println("LittleFS Error. Web page cannot be served.");
+        lcd.clear();
+        lcd.print("FS Error");
+        delay(1000);
+    }
+
+    // Web Server Setup
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/readings", HTTP_GET, handleReadings);
+    server.on("/start_test", HTTP_POST, handleStartTest);
+    server.onNotFound([](){
+        server.send(404, "text/plain", "Not Found");
+    });
+    server.begin();
+    
+    Serial.println("HTTP server started");
+
+    delay(1000);
+    currentState = IDLE;
+}
+
+// ------------------------------------------------------------------
+// MAIN LOOP - NO CHANGES NEEDED
+// ------------------------------------------------------------------
+
+void loop() {
+    server.handleClient();
+
+    unsigned long currentMillis = millis();
+    int waterLevelState = digitalRead(LEVEL_SENSOR_PIN);
+    
+    // Mode toggle button check with debounce
+    bool modeSwitchPressed = (digitalRead(PUMP_SWITCH_PIN) == LOW);
+    if (modeSwitchPressed && (currentMillis - lastModeSwitchPress > debounceDelay)) {
+        lastModeSwitchPress = currentMillis;
+        if (currentState == IDLE) {
+            // Toggle between pump and solenoid modes
+            pumpModeActive = !pumpModeActive;
+            Serial.print("Mode changed to: ");
+            Serial.println(pumpModeActive ? "PUMP" : "SOLENOID");
+            updateIdleDisplay(); // Update display immediately when mode changes
+        }
+    }
+    
+    // Manual start button check with debounce
+    bool manualButtonPressed = (digitalRead(MANUAL_START_PIN) == LOW);
+    if (manualButtonPressed && (currentMillis - lastButtonPress > debounceDelay)) {
+        lastButtonPress = currentMillis;
+        if (currentState == IDLE) {
+            currentState = MANUAL_START;
+        }
+    }
+
+    // WiFi Status Check
+    if (currentState == IDLE || currentState == CYCLE_END_DELAY) {
+        if (currentMillis - lastWiFiCheckTime >= WIFI_CHECK_INTERVAL_MS) {
+            wl_status_t wifiStatus = WiFi.status();
+            bool wasWiFiConnected = isWiFiConnected;
+            isWiFiConnected = (wifiStatus == WL_CONNECTED);
+
+            if (!isWiFiConnected && wasWiFiConnected) {
+                // WiFi just disconnected
+                lcd.clear(); 
+                lcd.print("No internet"); 
+                lcd.setCursor(0, 1); 
+                lcd.print("connection"); 
+                lcdShowingWiFiStatus = true;
+                wifiStatusDisplayStart = currentMillis;
+            } else if (isWiFiConnected && !wasWiFiConnected) {
+                // WiFi just reconnected
+                lcd.clear(); 
+                lcd.print("WiFi Reconnected! ✅"); 
+                lcd.setCursor(0, 1); 
+                lcd.print(WiFi.localIP()); 
+                lcdShowingWiFiStatus = true;
+                wifiStatusDisplayStart = currentMillis;
+            } else if (lcdShowingWiFiStatus && (currentMillis - wifiStatusDisplayStart >= WIFI_STATUS_DISPLAY_TIME)) {
+                // WiFi status display timeout - return to normal display
+                lcdShowingWiFiStatus = false;
+                updateIdleDisplay();
+            }
+            lastWiFiCheckTime = currentMillis;
+        }
+    } else {
+        // Not in IDLE state - clear WiFi status flag if set
+        if (lcdShowingWiFiStatus) {
+            lcdShowingWiFiStatus = false;
+        }
+    }
+
+    switch (currentState) {
+        case IDLE:
+            if (!lcdShowingWiFiStatus) {
+                updateIdleDisplay();
+            }
+            break;
+
+        case WEB_START:
+        case MANUAL_START:
+            // Use the current pumpModeActive setting
+            currentState = CYCLE_START_DELAY;
+            break;
+
+        case CYCLE_START_DELAY:
+            {
+            for (int i = CYCLE_DELAY_SEC; i > 0; i--) {
+                lcd.clear(); 
+                lcd.print((pumpModeActive) ? "Water Inlet Pump" : "Water Inlet Main");
+                lcd.setCursor(0, 1); lcd.printf("%d seconds...", i); 
+                server.handleClient(); 
+                delay(1000);
+            }
+            currentState = (pumpModeActive) ? FILL_PUMP : FILL_MAIN;
+            lcd.clear(); lcd.print("Starting Fill...");
+            }
+            break;
+
+        case FILL_MAIN:
+            digitalWrite(VALVE_IN_PIN, LOW);  
+            digitalWrite(PUMP_PIN, HIGH);   
+            lcd.setCursor(0, 1); lcd.print("Filling (Main)... ");
+            if (waterLevelState == HIGH) {
+                digitalWrite(VALVE_IN_PIN, HIGH); 
+                currentState = SENSING;
+                sensingStartTime = currentMillis;
+            }
+            break;
+
+        case FILL_PUMP:
+            digitalWrite(PUMP_PIN, LOW);      
+            digitalWrite(VALVE_IN_PIN, HIGH); 
+            lcd.setCursor(0, 1); lcd.print("Filling (Pump)... ");
+            if (waterLevelState == HIGH) {
+                digitalWrite(PUMP_PIN, HIGH); 
+                currentState = SENSING;
+                sensingStartTime = currentMillis;
+            }
+            break;
+
+        case SENSING:
+            lcd.clear(); lcd.print("Testing Water...");
+            if (currentMillis - sensingStartTime >= STABILIZATION_TIME_MS) {
+                readAllSensors();
+                displayGroupIndex = 0;
+                displayGroupTimer = currentMillis;
+                displaySensorReading(displayGroupIndex);
+                currentState = DISPLAY_READINGS;
+            }
+            break;
+
+        case DISPLAY_READINGS:
+            if (currentMillis - displayGroupTimer >= DISPLAY_GROUP_TIME_MS) {
+                displayGroupIndex++;
+                displayGroupTimer = currentMillis;
+
+                if (displayGroupIndex <= 4) {
+                    displaySensorReading(displayGroupIndex);
+                }
+                else {
+                    if (isWiFiConnected) {
+                        lcd.setCursor(0, 1);
+                        lcd.print("Uploading Data...");
+                        sendDataToServer();
+                    } else {
+                        Serial.println("Skipping upload due to no WiFi.");
+                    }
+                    currentState = DRAINING;
+                }
+            }
+            break;
+
+        case DRAINING:
+            lcd.clear(); lcd.print("Draining Water...");
+            digitalWrite(VALVE_OUT_PIN, LOW);
+
+            for(int i = 0; i < DRAIN_TIME_MS / 1000; i++) {
+                server.handleClient();
+                lcd.setCursor(0, 1);
+                lcd.printf("Wait... (%ds)", DRAIN_TIME_MS/1000 - i);
+                delay(1000);
+            }
+
+            digitalWrite(VALVE_OUT_PIN, HIGH);
+            lcd.setCursor(0, 1);
+            lcd.print("Drain Complete. ✅");
+            delay(1000);
+            currentState = CYCLE_END_DELAY;
+            break;
+
+        case CYCLE_END_DELAY:
+            lcd.clear(); 
+            lcd.setCursor(0, 0); 
+            lcd.print("Test Complete!");
+            lcd.setCursor(0, 1); 
+            lcd.print("Ready for next");
+            delay(3000);
+            currentState = IDLE;
+            webTriggered = false;
+            break;
+    }
+
+    // Ensure the valve/pump is off when not actively filling or draining
+    if (currentState != FILL_MAIN && currentState != FILL_PUMP) {
+        digitalWrite(VALVE_IN_PIN, HIGH);
+        digitalWrite(PUMP_PIN, HIGH);
+    }
+}
