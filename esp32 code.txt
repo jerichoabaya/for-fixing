@@ -7,8 +7,8 @@
 #include <HTTPClient.h> 
 
 // --- WIFI CREDENTIALS ---
-#define WIFI_SSID "AMCJSLZJNGE"
-#define WIFI_PASSWORD "05061423"
+#define WIFI_SSID "iPhone 11"
+#define WIFI_PASSWORD "11142000"
 
 // --- STATION AND DEVICE ID ---
 const char* sensorId = "ISUIT-WQTAMS-0001"; 
